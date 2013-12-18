@@ -38,14 +38,36 @@
 #endif
 
 #define HCID_STOP_DELAY_USEC 500000
+#define DELAY_USEC 2000000
 
 #define MIN(x,y) (((x)<(y))?(x):(y))
+#define HCISMD_MOD_PARAM "/sys/module/hci_smd/parameters/hcismd_set"
 
+/*Variables to identify the transport using msm type*/
+static char transport_type[PROPERTY_VALUE_MAX];
+static char bt_soc_type[PROPERTY_VALUE_MAX];
+static int is_transportSMD = -1;
+static char hciattach_serv[20];
 
 static int rfkill_id = -1;
 static char *rfkill_state_path = NULL;
 
-#ifndef BLUETOOTH_DOES_NOT_USE_RFKILL
+static void get_hci_trasport() {
+
+    int ret = -1;
+    ret = property_get("ro.qualcomm.bt.hci_transport", transport_type, NULL);
+    if(ret == 0)
+        ALOGI("ro.qualcomm.bt.hci_transport not set\n");
+    else
+        ALOGI("ro.qualcomm.bt.hci_transport %s \n", transport_type);
+
+    if (!strcasecmp(transport_type, "smd"))
+        is_transportSMD = 1;
+    else
+        is_transportSMD = 0;
+
+}
+
 static int init_rfkill() {
     char path[64];
     char buf[16];
@@ -136,8 +158,31 @@ out:
     if (fd >= 0) close(fd);
     return ret;
 }
-#endif
 
+static int set_hci_smd_transport(int on) {
+    int sz;
+    int fd = -1;
+    int ret = -1;
+    const char buffer = (on ? '1' : '0');
+
+    fd = open(HCISMD_MOD_PARAM, O_WRONLY);
+    if (fd < 0) {
+        ALOGE("open(%s) for write failed: %s (%d)", HCISMD_MOD_PARAM,
+             strerror(errno), errno);
+        goto out;
+    }
+    sz = write(fd, &buffer, 1);
+    if (sz < 0) {
+        ALOGE("write(%s) failed: %s (%d)", HCISMD_MOD_PARAM, strerror(errno),
+             errno);
+        goto out;
+    }
+    ret = 0;
+
+out:
+    if (fd >= 0) close(fd);
+    return ret;
+}
 static inline int create_hci_sock() {
     int sk = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
     if (sk < 0) {
@@ -147,40 +192,60 @@ static inline int create_hci_sock() {
     return sk;
 }
 
+static int is_bt_soc_ath() {
+    int ret = 0;
+
+    ret = property_get("qcom.bluetooth.soc", bt_soc_type, NULL);
+
+    if (ret != 0) {
+        ALOGI("qcom.bluetooth.soc set to %s\n", bt_soc_type);
+        if (!strncasecmp(bt_soc_type, "ath3k", sizeof("ath3k")))
+            return 1;
+    } else {
+        ALOGI("qcom.bluetooth.soc not set, so using default.\n");
+    }
+
+    return 0;
+}
+
 int bt_enable() {
     ALOGV(__FUNCTION__);
 
     int ret = -1;
     int hci_sock = -1;
     int attempt;
+    static int bt_on_once;
 
-#ifndef BLUETOOTH_DOES_NOT_USE_RFKILL
-    if (set_bluetooth_power(1) < 0) goto out;
-#endif
+    if(-1 == is_transportSMD)
+      get_hci_trasport();
 
-#ifndef BLUETOOTH_HCIATTACH_USING_PROPERTY
-    ALOGI("Starting hciattach daemon");
-    if (property_set("ctl.start", "hciattach") < 0)
-#else
-    ALOGI("Enable hci tranport");
-    if (property_set("bluetooth.hciattach", "true") < 0)
-#endif
-    {
-        ALOGE("Failed to start hciattach");
-#ifndef BLUETOOTH_DOES_NOT_USE_RFKILL
-        set_bluetooth_power(0);
-#endif
+    if (is_bt_soc_ath()) {
+        strlcpy(hciattach_serv, "hciattach_ath3k", sizeof(hciattach_serv));
+        is_transportSMD = 0;
+    } else
+        strlcpy(hciattach_serv, "hciattach", sizeof(hciattach_serv));
+
+    if (!is_transportSMD)
+        if (set_bluetooth_power(1) < 0)
+            goto out;
+
+    ALOGI("Starting hciattach daemon with service %s", hciattach_serv);
+    if (property_set("ctl.start", hciattach_serv) < 0) {
+        ALOGE("Failed to start hciattach service %s", hciattach_serv);
+        if (!is_transportSMD)
+            set_bluetooth_power(0);
         goto out;
     }
 
     // Try for 10 seconds, this can only succeed once hciattach has sent the
     // firmware and then turned on hci device via HCIUARTSETPROTO ioctl
-    for (attempt = 100; attempt > 0;  attempt--) {
+    for (attempt = 1000; attempt > 0;  attempt--) {
         hci_sock = create_hci_sock();
         if (hci_sock < 0) goto out;
 
         ret = ioctl(hci_sock, HCIDEVUP, HCI_DEV_ID);
 
+        ALOGI("bt_enable: ret: %d, errno: %d", ret, errno);
         if (!ret) {
             break;
         } else if (errno == EALREADY) {
@@ -188,30 +253,26 @@ int bt_enable() {
             break;
         }
 
-        ALOGI("%s: ioctl(%d, HCIDEVUP, HCI_DEV_ID) failed: %s (%d)",
-              __FUNCTION__, hci_sock, strerror(errno), errno);
-
         close(hci_sock);
-        usleep(100 * 1000);  // 100 ms retry delay
+        usleep(100000);  // 100 ms retry delay
     }
     if (attempt == 0) {
         ALOGE("%s: Timeout waiting for HCI device to come up, error- %d, ",
             __FUNCTION__, ret);
-        if (property_set("ctl.stop", "hciattach") < 0) {
-            ALOGE("Error stopping hciattach");
+        if (!is_transportSMD) {
+            if (property_set("ctl.stop", hciattach_serv) < 0) {
+                ALOGE("Error stopping hciattach");
+            }
+            set_bluetooth_power(0);
         }
-#ifndef BLUETOOTH_DOES_NOT_USE_RFKILL
-        set_bluetooth_power(0);
-#endif
         goto out;
     }
 
     ALOGI("Starting bluetoothd deamon");
     if (property_set("ctl.start", "bluetoothd") < 0) {
         ALOGE("Failed to start bluetoothd");
-#ifndef BLUETOOTH_DOES_NOT_USE_RFKILL
-        set_bluetooth_power(0);
-#endif
+        if (!is_transportSMD)
+            set_bluetooth_power(0);
         goto out;
     }
 
@@ -228,6 +289,15 @@ int bt_disable() {
     int ret = -1;
     int hci_sock = -1;
 
+    if (-1 == is_transportSMD)
+       get_hci_trasport();
+
+    if (is_bt_soc_ath()) {
+        strlcpy(hciattach_serv, "hciattach_ath3k", sizeof(hciattach_serv));
+        is_transportSMD = 0;
+    } else
+        strlcpy(hciattach_serv, "hciattach", sizeof(hciattach_serv));
+
     ALOGI("Stopping bluetoothd deamon");
     if (property_set("ctl.stop", "bluetoothd") < 0) {
         ALOGE("Error stopping bluetoothd");
@@ -238,24 +308,21 @@ int bt_disable() {
     hci_sock = create_hci_sock();
     if (hci_sock < 0) goto out;
     ioctl(hci_sock, HCIDEVDOWN, HCI_DEV_ID);
-
-#ifndef BLUETOOTH_HCIATTACH_USING_PROPERTY
-    ALOGI("Stopping hciattach deamon");
-    if (property_set("ctl.stop", "hciattach") < 0)
-#else
-    ALOGI("Disable hci tranport");
-    if (property_set("bluetooth.hciattach", "false") < 0)
-#endif
-    {
-        ALOGE("Error stopping hciattach");
-        goto out;
+    if (!is_transportSMD) {
+        ALOGI("Stopping hciattach deamon %s", hciattach_serv);
+        if (property_set("ctl.stop", hciattach_serv) < 0) {
+            ALOGE("Error stopping hciattach");
+            goto out;
+        }
     }
 
-#ifndef BLUETOOTH_DOES_NOT_USE_RFKILL
-    if (set_bluetooth_power(0) < 0) {
-        goto out;
+    if (!is_transportSMD) {
+        if (set_bluetooth_power(0) < 0)
+            goto out;
+    } else {
+        set_hci_smd_transport(0);
     }
-#endif
+
     ret = 0;
 
 out:
@@ -270,13 +337,14 @@ int bt_is_enabled() {
     int ret = -1;
     struct hci_dev_info dev_info;
 
+    if (-1 == is_transportSMD)
+       get_hci_trasport();
 
-#ifndef BLUETOOTH_DOES_NOT_USE_RFKILL
     // Check power first
-    ret = check_bluetooth_power();
-    if (ret == -1 || ret == 0) goto out;
-#endif
-
+    if (!is_transportSMD) {
+        ret = check_bluetooth_power();
+        if (ret == -1 || ret == 0) goto out;
+    }
     ret = -1;
 
     // Power is on, now check if the HCI interface is up
@@ -284,7 +352,8 @@ int bt_is_enabled() {
     if (hci_sock < 0) goto out;
 
     dev_info.dev_id = HCI_DEV_ID;
-    if (ioctl(hci_sock, HCIGETDEVINFO, (void *)&dev_info) < 0) {
+    if (ret = ioctl(hci_sock, HCIGETDEVINFO, (void *)&dev_info) < 0) {
+        ALOGE("ioctl error: ret=%d", ret);
         ret = 0;
         goto out;
     }
